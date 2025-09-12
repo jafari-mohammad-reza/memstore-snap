@@ -1,6 +1,8 @@
 package store
 
 import (
+	"compress/gzip"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"path"
@@ -10,11 +12,16 @@ import (
 	"github.com/edsrzf/mmap-go"
 )
 
+type Mapped struct {
+	file *os.File
+	mp   *mmap.MMap
+}
+
 // there should be options as rotation, multiple snapshot files
 type Store[T any] struct {
 	opt      StoreOpt
 	walFile  *os.File
-	segFiles map[string]*mmap.MMap // map of rotation period to file
+	segFiles map[string]*Mapped // map of rotation period to file
 	walChan  chan WalRec
 	walMu    sync.Mutex
 }
@@ -48,7 +55,10 @@ func (s *Store[T]) Stop() error {
 		return err
 	}
 	for _, f := range s.segFiles {
-		if err := f.Unmap(); err != nil {
+		if err := f.file.Close(); err != nil {
+			return err
+		}
+		if err := f.mp.Unmap(); err != nil {
 			return err
 		}
 	}
@@ -78,8 +88,8 @@ func prepDir(opts StoreOpt) error {
 	opts.SaveDir = "snaps"
 	return nil
 }
-func prepSegs(opts StoreOpt) (map[string]*mmap.MMap, error) {
-	segMap := make(map[string]*mmap.MMap, 1)
+func prepSegs(opts StoreOpt) (map[string]*Mapped, error) {
+	segMap := make(map[string]*Mapped, 1)
 	if opts.SnapShot.Rotate {
 		index := time.Now().Format(time.DateOnly)
 		mapped, err := newMmap(fmt.Sprintf("%s.dat", index), opts)
@@ -96,7 +106,8 @@ func prepSegs(opts StoreOpt) (map[string]*mmap.MMap, error) {
 	segMap["snapshot.dat"] = mapped
 	return segMap, nil
 }
-func newMmap(name string, opts StoreOpt) (*mmap.MMap, error) {
+
+func newMmap(name string, opts StoreOpt) (*Mapped, error) {
 	dir := opts.SaveDir
 	f, err := os.OpenFile(path.Join(dir, name), os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -112,7 +123,10 @@ func newMmap(name string, opts StoreOpt) (*mmap.MMap, error) {
 	if err != nil {
 		panic(err)
 	}
-	return &mapped, nil
+	return &Mapped{
+		file: f,
+		mp:   &mapped,
+	}, nil
 }
 func prepWal(opts StoreOpt) (*os.File, error) {
 	f, err := os.OpenFile(path.Join(opts.SaveDir, "wal.log"), os.O_CREATE|os.O_RDWR, 0644)
@@ -120,4 +134,74 @@ func prepWal(opts StoreOpt) (*os.File, error) {
 		return nil, fmt.Errorf("failed to open wal file: %s", err.Error())
 	}
 	return f, nil
+}
+
+func (s *Store[T]) Snapshot(entries []T) error {
+	seg, err := s.getSeg()
+	if err != nil {
+		return err
+	}
+	seg.mp.Lock()
+	if !s.opt.SnapShot.Rotate {
+		// as we dont have rotation we truncate previous snapshot
+		seg.file.Write([]byte{}) // truncate previous snapshot
+	}
+	seg.mp.Unlock()
+	defer seg.mp.Unmap()
+	defer seg.file.Close()
+	gzWriter := gzip.NewWriter(seg.file)
+	defer gzWriter.Close()
+	encoder := gob.NewEncoder(gzWriter)
+	if err := encoder.Encode(entries); err != nil {
+		return fmt.Errorf("failed to encode entries data: %w", err)
+	}
+	seg.mp.Flush()
+	return nil
+}
+
+func (s *Store[T]) LoadSnapshot(dest *T) error {
+	seg, err := s.getSeg()
+	if err != nil {
+		return erra
+	}
+	gzReader, err := gzip.NewReader(seg.file)
+	if err != nil {
+		return err
+	}
+	defer gzReader.Close()
+
+	decoder := gob.NewDecoder(gzReader)
+	if err := decoder.Decode(dest); err != nil {
+		return fmt.Errorf("failed to decode snapshot data: %w", err)
+	}
+	return nil
+}
+func (s *Store[T]) getSeg() (*Mapped, error) {
+	var seg *Mapped
+	if s.opt.SnapShot.Rotate {
+		name := fmt.Sprintf("%d.dat", len(s.segFiles)+1)
+		segF, ok := s.segFiles[name]
+		if !ok {
+			segF, err := newMmap(name, s.opt)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create new snapshot file: %s", err.Error())
+			}
+			s.segFiles[name] = segF
+			seg = segF
+		}
+		seg = segF
+	} else {
+		name := "snapshot.dat"
+		segF, ok := s.segFiles[name]
+		if !ok {
+			segF, err := newMmap(name, s.opt)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create new snapshot file: %s", err.Error())
+			}
+			s.segFiles[name] = segF
+			seg = segF
+		}
+		seg = segF
+	}
+	return seg, nil
 }

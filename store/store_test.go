@@ -44,8 +44,8 @@ func TestCreateStorage(t *testing.T) {
 	assert.False(t, info.IsDir(), "Snapshot file should exist")
 
 	mmapSeg := st.segFiles["snapshot.dat"]
-	copy(*mmapSeg, []byte("hello test"))
-	assert.Equal(t, "h", string((*mmapSeg)[0]), "first byte should match written data")
+	copy(*mmapSeg.mp, []byte("hello test"))
+	assert.Equal(t, "h", string((*mmapSeg.mp)[0]), "first byte should match written data")
 
 	err = st.Stop()
 	assert.NoError(t, err)
