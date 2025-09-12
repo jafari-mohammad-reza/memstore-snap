@@ -129,7 +129,22 @@ func prepDir(opts StoreOpt) error {
 	return nil
 }
 func prepSegs(opts StoreOpt) (map[string]*Mapped, error) {
-	return make(map[string]*Mapped), nil
+	segMap := make(map[string]*Mapped, 1)
+	if opts.SnapShot.Rotate {
+		index := time.Now().Format(time.DateOnly)
+		mp, err := newMmap(fmt.Sprintf("%s.dat", index), opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create new mmap: %s", err.Error())
+		}
+		segMap[index] = mp
+		return segMap, nil
+	}
+	mapped, err := newMmap("snapshot.dat", opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new mmap: %s", err.Error())
+	}
+	segMap["snapshot.dat"] = mapped
+	return segMap, nil
 }
 
 func newMmap(name string, opts StoreOpt) (*Mapped, error) {
@@ -225,8 +240,11 @@ func (m *Mapped) calcChecksum(dataSize uint64) ([]byte, error) {
 	return hash.Sum(nil), nil
 }
 func prepWal(opts StoreOpt) (*os.File, error) {
-	return os.OpenFile(path.Join(opts.SaveDir, "wal.log"),
-		os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path.Join(opts.SaveDir, "wal.log"), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open wal file: %s", err.Error())
+	}
+	return f, nil
 }
 
 func (s *Store[T]) Snapshot(entries []T) error {
@@ -304,7 +322,7 @@ func (s *Store[T]) SnapshotBinary(entries []T, writer func(w io.Writer, entry T)
 	return seg.mp.Flush()
 }
 
-func (s *Store[T]) LoadSnapshot(dest *T) error {
+func (s *Store[T]) LoadSnapshot(dest *[]T) error {
 	seg, err := s.getSeg()
 	if err != nil {
 		return err
